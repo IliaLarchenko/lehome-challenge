@@ -2,7 +2,13 @@ import os
 import json
 from collections.abc import Callable
 from typing import Dict, Tuple
-from pynput.keyboard import Listener, Key
+# pynput needs a display server; headless eval must still be able to import
+# this module (it is pulled in unconditionally via lehome.devices).
+try:
+    from pynput.keyboard import Listener, Key
+except Exception:  # pragma: no cover - headless / no X server
+    Listener = None
+    Key = None
 
 from .common.motors import (
     FeetechMotorsBus,
@@ -60,6 +66,11 @@ class SO101Leader(Device):
         self._reset_state = False
         self._additional_callbacks = {}
 
+        if Listener is None:
+            raise RuntimeError(
+                "pynput is unavailable (headless / no display server) — "
+                "SO101Leader keyboard hooks cannot be used here"
+            )
         self.listener = Listener(on_press=self.on_press, on_release=self.on_release)
         self.listener.start()
         self._display_controls()

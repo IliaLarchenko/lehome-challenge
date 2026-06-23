@@ -485,4 +485,58 @@ def setup_eval_parser() -> argparse.ArgumentParser:
         help="URL of the Docker policy server (used when --policy_type docker).",
     )
 
+    # Remote-driven evaluation arguments (--policy_type remote)
+    parser.add_argument(
+        "--remote_url",
+        type=str,
+        default=None,
+        help="URL of the remote server that drives the session "
+        "(used when --policy_type remote; env LEHOME_REMOTE_URL also works).",
+    )
+    parser.add_argument(
+        "--garment_name",
+        type=str,
+        default=None,
+        help="Evaluate a single specific garment (skips the Release list file).",
+    )
+    parser.add_argument(
+        "--session_id",
+        type=str,
+        default="default",
+        help="Session id forwarded to the remote server (lets one server "
+        "drive several concurrent simulations).",
+    )
+    parser.add_argument(
+        "--same_seed",
+        action="store_true",
+        default=False,
+        help="Re-pin --seed before every episode reset (cfg attributes only; "
+        "garment_rng is not re-seeded, so use num_episodes=1 for fully "
+        "reproducible garment poses).",
+    )
+    parser.add_argument(
+        "--camera_width",
+        type=int,
+        default=None,
+        help="Override render width for all cameras (env LEHOME_CAMERA_WIDTH also works).",
+    )
+    parser.add_argument(
+        "--camera_height",
+        type=int,
+        default=None,
+        help="Override render height for all cameras (env LEHOME_CAMERA_HEIGHT also works).",
+    )
+    parser.add_argument(
+        "--top_camera_width",
+        type=int,
+        default=None,
+        help="Override the TOP camera width only (e.g. 1280 for the real-BC 16:9 framing).",
+    )
+    parser.add_argument(
+        "--top_camera_height",
+        type=int,
+        default=None,
+        help="Override the TOP camera height only (e.g. 720 for the real-BC 16:9 framing).",
+    )
+
     return parser

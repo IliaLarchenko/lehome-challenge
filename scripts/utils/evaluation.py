@@ -30,6 +30,56 @@ from lehome.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def apply_camera_overrides(env_cfg, args: argparse.Namespace) -> None:
+    """Apply optional camera resolution / depth overrides to the env config.
+
+    CLI args win; LEHOME_CAMERA_* / LEHOME_TOP_CAMERA_* env vars are the
+    fallback (useful when a wrapper process owns the environment). Depth is
+    dropped from the top camera when LEHOME_NO_DEPTH=1 (saves GPU + network;
+    only the top camera has depth, wrists are RGB-only already).
+
+    decimation/render_interval are intentionally left at the defaults (1/1):
+    the simulation runs at its native rate and episodes are treated as 30 Hz
+    for dataset purposes regardless of physics_hz.
+    """
+    cw = args.camera_width or os.environ.get("LEHOME_CAMERA_WIDTH")
+    ch = args.camera_height or os.environ.get("LEHOME_CAMERA_HEIGHT")
+    tcw = args.top_camera_width or os.environ.get("LEHOME_TOP_CAMERA_WIDTH")
+    tch = args.top_camera_height or os.environ.get("LEHOME_TOP_CAMERA_HEIGHT")
+
+    if cw is not None and ch is not None:
+        try:
+            w, h = int(cw), int(ch)
+            env_cfg.left_wrist.width = w
+            env_cfg.left_wrist.height = h
+            env_cfg.right_wrist.width = w
+            env_cfg.right_wrist.height = h
+            # Top defaults to the shared resolution; overridden below.
+            env_cfg.top_camera.width = w
+            env_cfg.top_camera.height = h
+            logger.info(f"Camera resolution set to {w}x{h}")
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Ignoring invalid camera resolution ({cw}x{ch}): {e}")
+
+    # Optional per-camera override for the TOP cam only (the real BC dataset
+    # is 720x1280 while the wrists are 480x640).
+    if tcw is not None and tch is not None:
+        try:
+            tw, th = int(tcw), int(tch)
+            env_cfg.top_camera.width = tw
+            env_cfg.top_camera.height = th
+            logger.info(f"Top camera resolution overridden to {tw}x{th}")
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Ignoring invalid top camera resolution ({tcw}x{tch}): {e}")
+
+    if os.environ.get("LEHOME_NO_DEPTH") == "1":
+        try:
+            env_cfg.top_camera.data_types = ["rgb"]
+            logger.info("Depth camera disabled (LEHOME_NO_DEPTH=1)")
+        except (AttributeError, Exception) as e:
+            logger.warning(f"Could not disable depth: {e}")
+
+
 def run_evaluation_loop(
     env: DirectRLEnv,
     policy: BasePolicy,
@@ -184,7 +234,7 @@ def run_evaluation_loop(
                 frame = {
                     k: v
                     for k, v in observation_dict.items()
-                    if k != "observation.top_depth"
+                    if k not in ("observation.top_depth", "check_status", "check_distances")
                 }
                 frame["task"] = args.task_description
                 eval_dataset.add_frame(frame)
@@ -248,12 +298,17 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
     else:
         env_cfg.use_random_seed = False
         env_cfg.seed = args.seed
+        # The garment initial pose is drawn from garment_rng, which is seeded
+        # from cfg.random_seed at env creation — mirror the CLI seed there so
+        # --seed actually controls the garment pose.
+        env_cfg.random_seed = args.seed
         # Propagate seed to sim config if structure exists
         if hasattr(env_cfg, "sim") and hasattr(env_cfg.sim, "seed"):
             env_cfg.sim.seed = args.seed
 
     env_cfg.garment_cfg_base_path = args.garment_cfg_base_path
     env_cfg.particle_cfg_path = args.particle_cfg_path
+    apply_camera_overrides(env_cfg, args)
 
     # 2. Initialize Policy (Using the Policy Registry)
     # This replaces create_il_policy, make_pre_post_processors, etc.
@@ -292,6 +347,10 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
     elif args.policy_type == "docker":
         # Docker policy connects to an external container
         policy_kwargs["docker_url"] = args.docker_url
+    elif args.policy_type == "remote":
+        # Remote policy: an external HTTP server drives the whole session.
+        policy_kwargs["remote_url"] = args.remote_url
+        policy_kwargs["session_id"] = args.session_id
     else:
         # For custom policies, pass policy_path as model_path if provided
         if args.policy_path:
@@ -325,39 +384,45 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
     # Only loads from 'Release' directory based on garment_type
     eval_list = []  # List of (name, stage)
 
-    # Evaluate a specific category based on garment_type
-    if args.garment_type == "custom":
-        # For 'custom' type, we load from the root Release_test_list.txt
-        eval_list_path = os.path.join(
-            args.garment_cfg_base_path, "Release", "Release_test_list.txt"
-        )
+    if args.garment_name:
+        # Explicit single garment from the CLI. Proxy-driven sessions switch
+        # garments in place afterwards, so the Release list is not consulted.
+        eval_list.append((args.garment_name, "Release"))
+        logger.info(f"Loaded 1 garments (explicit --garment_name {args.garment_name})")
     else:
-        # Map argument to specific sub-category directory
-        type_map = {
-            "top_long": "Top_Long",
-            "top_short": "Top_Short",
-            "pant_long": "Pant_Long",
-            "pant_short": "Pant_Short",
-        }
-        file_prefix = type_map.get(args.garment_type, "Top_Long")
-        # Path: Assets/objects/Challenge_Garment/Release/Top_Long/Top_Long.txt
-        eval_list_path = os.path.join(
-            args.garment_cfg_base_path, "Release", file_prefix, f"{file_prefix}.txt"
+        # Evaluate a specific category based on garment_type
+        if args.garment_type == "custom":
+            # For 'custom' type, we load from the root Release_test_list.txt
+            eval_list_path = os.path.join(
+                args.garment_cfg_base_path, "Release", "Release_test_list.txt"
+            )
+        else:
+            # Map argument to specific sub-category directory
+            type_map = {
+                "top_long": "Top_Long",
+                "top_short": "Top_Short",
+                "pant_long": "Pant_Long",
+                "pant_short": "Pant_Short",
+            }
+            file_prefix = type_map.get(args.garment_type, "Top_Long")
+            # Path: Assets/objects/Challenge_Garment/Release/Top_Long/Top_Long.txt
+            eval_list_path = os.path.join(
+                args.garment_cfg_base_path, "Release", file_prefix, f"{file_prefix}.txt"
+            )
+
+        logger.info(
+            f"Loading evaluation list for category '{args.garment_type}' from: {eval_list_path}"
         )
 
-    logger.info(
-        f"Loading evaluation list for category '{args.garment_type}' from: {eval_list_path}"
-    )
+        if not os.path.exists(eval_list_path):
+            raise FileNotFoundError(f"Evaluation list not found: {eval_list_path}")
 
-    if not os.path.exists(eval_list_path):
-        raise FileNotFoundError(f"Evaluation list not found: {eval_list_path}")
+        with open(eval_list_path, "r") as f:
+            names = [line.strip() for line in f.readlines() if line.strip()]
+            for name in names:
+                eval_list.append((name, "Release"))
 
-    with open(eval_list_path, "r") as f:
-        names = [line.strip() for line in f.readlines() if line.strip()]
-        for name in names:
-            eval_list.append((name, "Release"))
-
-    logger.info(f"Loaded {len(eval_list)} garments for category: {args.garment_type}")
+        logger.info(f"Loaded {len(eval_list)} garments for category: {args.garment_type}")
 
     if not eval_list:
         raise ValueError(
@@ -375,38 +440,55 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
     env.initialize_obs()
 
     try:
-        for garment_idx, (garment_name, garment_stage) in enumerate(eval_list):
-            logger.info(
-                f"Evaluating: {garment_name} ({garment_stage}) ({garment_idx+1}/{len(eval_list)})"
-            )
+        if getattr(policy, "uses_remote_loop", False):
+            # Remote-driven session: an external HTTP server decides which
+            # garments + seeds to run, supplies actions, and records the
+            # trajectory. One call drives the whole session (garments are
+            # switched in place), so eval_list is only used for the first env.
+            from .visual_augmentation import build_visual_augmentation
+            from .remote_loop import run_remote_loop
 
-            # Switch Garment Logic
-            if garment_idx > 0:
-                if hasattr(env, "switch_garment"):
-                    env.switch_garment(garment_name, garment_stage)
-                    env.reset()
-                    policy.reset()
-                else:
-                    env.close()
-                    env_cfg.garment_name = garment_name
-                    env_cfg.garment_version = garment_stage
-                    env = gym.make(args.task, cfg=env_cfg).unwrapped
-                    env.initialize_obs()
-                    policy.reset()
+            label = os.environ.get("LEHOME_WORKER_LABEL", "remote")
+            augmentor = build_visual_augmentation(label)
+            logger.info(f"Evaluating: {first_name} (remote-driven session)")
 
-            # Run Loop
-            metrics = run_evaluation_loop(
-                env=env,
-                policy=policy,
-                args=args,
-                ee_solver=ee_solver,
-                is_bimanual=is_bimanual,
-                garment_name=garment_name,
-            )
-
+            metrics = run_remote_loop(env, policy, args, augmentor, label=label)
             all_garment_metrics.append(
-                {"garment_name": garment_name, "metrics": metrics}
+                {"garment_name": first_name, "metrics": metrics}
             )
+        else:
+            for garment_idx, (garment_name, garment_stage) in enumerate(eval_list):
+                logger.info(
+                    f"Evaluating: {garment_name} ({garment_stage}) ({garment_idx+1}/{len(eval_list)})"
+                )
+
+                # Switch Garment Logic
+                if garment_idx > 0:
+                    if hasattr(env, "switch_garment"):
+                        env.switch_garment(garment_name, garment_stage)
+                        env.reset()
+                        policy.reset()
+                    else:
+                        env.close()
+                        env_cfg.garment_name = garment_name
+                        env_cfg.garment_version = garment_stage
+                        env = gym.make(args.task, cfg=env_cfg).unwrapped
+                        env.initialize_obs()
+                        policy.reset()
+
+                # Run Loop
+                metrics = run_evaluation_loop(
+                    env=env,
+                    policy=policy,
+                    args=args,
+                    ee_solver=ee_solver,
+                    is_bimanual=is_bimanual,
+                    garment_name=garment_name,
+                )
+
+                all_garment_metrics.append(
+                    {"garment_name": garment_name, "metrics": metrics}
+                )
 
     finally:
         env.close()

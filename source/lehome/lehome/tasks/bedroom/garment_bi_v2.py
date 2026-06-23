@@ -12,13 +12,19 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sensors import TiledCamera
-from pxr import UsdShade, Sdf, UsdGeom
+from pxr import UsdShade, Sdf, UsdGeom, Vt
 import omni.kit.commands
 from isaacsim.core.utils.prims import is_prim_path_valid
 import isaacsim.core.utils.prims as prims_utils
 
 from lehome.tasks.bedroom.garment_bi_cfg_v2 import GarmentEnvCfg
-from lehome.utils.success_checker_chanllege import success_checker_garment_fold
+from lehome.utils.success_checker_chanllege import (
+    check_pant_long,
+    check_pant_short,
+    check_top_sleeve,
+    get_object_particle_position,
+    success_checker_garment_fold,
+)
 from lehome.utils.depth_to_pointcloud import generate_pointcloud_from_data
 from lehome.assets.scenes.bedroom import MARBLE_BEDROOM_USD_PATH
 from lehome.devices.action_process import preprocess_device_action
@@ -41,6 +47,13 @@ class GarmentEnv(DirectRLEnv):
 
         # Cache for distance-based reward (to handle step_interval decorator)
         self._last_computed_reward = 0.0
+
+        # Per-condition success-check cache: (status, distances) float32 arrays,
+        # refreshed every LEHOME_CHECK_INTERVAL observations (see
+        # _update_check_status_cache). Cleared on reset / garment switch.
+        self._check_interval = int(os.environ.get("LEHOME_CHECK_INTERVAL", "30"))
+        self._check_cache = None
+        self._check_step_counter = 0
 
         self.garment_loader = ChallengeGarmentLoader(cfg.garment_cfg_base_path)
         self.garment_config = self.garment_loader.load_garment_config(
@@ -279,14 +292,8 @@ class GarmentEnv(DirectRLEnv):
         joint_pos = torch.cat([left_joint_pos, right_joint_pos], dim=1)
         joint_pos = joint_pos.squeeze(0)
         top_camera_rgb = self.top_camera.data.output["rgb"]
-        top_camera_depth = self.top_camera.data.output["depth"].squeeze()
         left_camera_rgb = self.left_camera.data.output["rgb"]
         right_camera_rgb = self.right_camera.data.output["rgb"]
-
-        # Convert depth from meters to millimeters (uint16)
-        # Range: 0-65535 mm (0-65.535 m), precision: 1 mm
-        depth_np = top_camera_depth.cpu().detach().numpy().copy()
-        depth_mm = np.clip(depth_np * 1000, 0, 65535).astype(np.uint16)
 
         observations = {
             "action": action.cpu().detach().numpy(),
@@ -303,9 +310,94 @@ class GarmentEnv(DirectRLEnv):
             .detach()
             .numpy()
             .squeeze(),
-            "observation.top_depth": depth_mm,
         }
+
+        # Depth is optional: absent when the top camera renders RGB only
+        # (cfg.top_camera.data_types == ["rgb"], e.g. LEHOME_NO_DEPTH=1 —
+        # saves GPU + transport).
+        if "depth" in self.top_camera.data.output:
+            top_camera_depth = self.top_camera.data.output["depth"].squeeze()
+            # Convert depth from meters to millimeters (uint16)
+            # Range: 0-65535 mm (0-65.535 m), precision: 1 mm
+            depth_np = top_camera_depth.cpu().detach().numpy().copy()
+            observations["observation.top_depth"] = np.clip(
+                depth_np * 1000, 0, 65535
+            ).astype(np.uint16)
+
+        # Per-condition success check status (cached, refreshed every
+        # self._check_interval observations). Calls the check functions
+        # directly instead of success_checker_garment_fold, whose
+        # @step_interval(50) decorator returns a literal False on 49 of 50
+        # calls and leaks its module-global counter across episodes.
+        self._check_step_counter += 1
+        should_check = (
+            self._check_step_counter % self._check_interval == 0
+            or self._check_cache is None
+        )
+        if should_check:
+            self._update_check_status_cache()
+        if self._check_cache is not None:
+            observations["check_status"] = self._check_cache[0]
+            observations["check_distances"] = self._check_cache[1]
+
         return observations
+
+    def clear_check_status_cache(self):
+        """Reset the success-check cache (call after reset / state restore)."""
+        self._check_cache = None
+        self._check_step_counter = 0
+
+    def _update_check_status_cache(self):
+        """Evaluate per-condition success checks and cache the result.
+
+        status[i] is 1.0 when condition i passes; distances[i] is the
+        value/threshold ratio for each condition (sorted by condition key).
+        For long pants three extra pairwise-proximity conditions are added as
+        an intermediate fold checkpoint.
+        """
+        if self.object is None:
+            return
+        try:
+            gt = self.garment_loader.get_garment_type(self.cfg.garment_name)
+            cp = self.object.check_points
+            scale = float(self.object.init_scale[0])
+            sd = [d * scale for d in self.object.success_distance]
+            p = get_object_particle_position(self.object, cp)
+            if p is None:
+                return
+            if gt in ("top-long-sleeve", "top-short-sleeve"):
+                _, details = check_top_sleeve(p, sd)
+            elif gt == "short-pant":
+                _, details = check_pant_short(p, sd)
+            elif gt == "long-pant":
+                _, details = check_pant_long(p, sd)
+                # Extra checks: pairwise proximity (intermediate fold checkpoint)
+                lp_thresh = 20.0 * scale
+                d5 = float(np.linalg.norm(np.array(p[0]) - np.array(p[1])))
+                d6 = float(np.linalg.norm(np.array(p[2]) - np.array(p[3])))
+                d7 = float(np.linalg.norm(np.array(p[4]) - np.array(p[5])))
+                details["condition_5"] = {"passed": d5 < lp_thresh, "value": d5, "threshold": lp_thresh}
+                details["condition_6"] = {"passed": d6 < lp_thresh, "value": d6, "threshold": lp_thresh}
+                details["condition_7"] = {"passed": d7 < lp_thresh, "value": d7, "threshold": lp_thresh}
+            else:
+                details = {}
+            n_cond = len(details)
+            status = np.zeros(n_cond, dtype=np.float32)
+            distances = np.zeros(n_cond, dtype=np.float32)
+            for i, key in enumerate(sorted(details)):
+                d = details[key]
+                if d.get("passed", False):
+                    status[i] = 1.0
+                v = d.get("value")
+                th = d.get("threshold")
+                if v is not None and th is not None and float(th) > 0:
+                    distances[i] = float(v) / float(th)
+            self._check_cache = (status, distances)
+        except Exception as err:
+            import traceback
+
+            logger.error(f"check_status error: {err}")
+            traceback.print_exc()
 
     def _get_workspace_pointcloud(
         self, env_index: int = 0, num_points: int = 2048, use_fps: bool = False
@@ -485,48 +577,28 @@ class GarmentEnv(DirectRLEnv):
         else:
             return bool(result)
 
-    def _get_success(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.object is None:
-            success = False
-            result = None
-        elif not hasattr(self.object, "_cloth_prim_view"):
-            success = False
-            result = None
-        else:
-            garment_type = self.garment_loader.get_garment_type(self.cfg.garment_name)
-            result = success_checker_garment_fold(self.object, garment_type)
+    def _get_success(self) -> torch.Tensor:
+        """Success = every cached check-status condition passes.
 
-            if isinstance(result, dict):
-                logger.info(
-                    f"[Success Check] Garment type: {result.get('garment_type', 'unknown')}, Thresholds: {result.get('thresholds', [])}"
-                )
-
-                details = result.get("details", {})
-                for key, condition_info in details.items():
-                    status = "✓" if condition_info.get("passed", False) else "✗"
-                    logger.info(
-                        f"  {condition_info.get('description', '')} -> {status}"
-                    )
-
-                success = result.get("success", False)
-                logger.info(
-                    f"[Success Check] Final result: {'Success ✓' if success else 'Failed ✗'}"
-                )
-            else:
-                success = bool(result)
-
-        if isinstance(success, bool):
-            success_tensor = torch.tensor(
-                [success] * len(self.episode_length_buf), device=self.device
-            )
-        else:
-            success_tensor = torch.zeros_like(self.episode_length_buf, dtype=torch.bool)
-        episode_success = success_tensor
-        return episode_success
+        Reads the per-condition cache maintained by _get_observations
+        (refreshed every LEHOME_CHECK_INTERVAL steps), so success is detected
+        within that interval instead of the 50-step cadence the
+        @step_interval-decorated success_checker_garment_fold imposes.
+        """
+        cached = self._check_cache
+        cs = cached[0] if isinstance(cached, tuple) else cached
+        if cs is None or len(cs) == 0:
+            return torch.tensor([False], device=self.device)
+        success = cs.min() > 0.5
+        return torch.tensor([success], device=self.device)
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
             env_ids = self.left_arm._ALL_INDICES
+
+        # Stale check results must not leak into the next episode
+        self.clear_check_status_cache()
+
         super()._reset_idx(env_ids)
 
         # Reset cached reward on episode reset
@@ -541,9 +613,38 @@ class GarmentEnv(DirectRLEnv):
             right_joint_pos, joint_ids=None, env_ids=env_ids
         )
 
+        # Zero residual joint velocities: writing only joint POSITIONS above
+        # lets the previous episode's velocities survive into the next episode
+        # and bias the first post-stabilize observation — giving ep_idx=0
+        # (fresh-init zero velocities) a distribution-match advantage over
+        # every ep_idx>=1.
+        try:
+            zero_l = torch.zeros_like(left_joint_pos)
+            zero_r = torch.zeros_like(right_joint_pos)
+            self.left_arm.write_joint_velocity_to_sim(
+                zero_l, joint_ids=None, env_ids=env_ids
+            )
+            self.right_arm.write_joint_velocity_to_sim(
+                zero_r, joint_ids=None, env_ids=env_ids
+            )
+        except Exception as err:
+            logger.warning(f"reset joint-vel zero failed: {err}")
+
         # Reset the garment object
         if self.object is not None:
             self.object.reset()
+
+        # Zero cloth particle velocities for the same reason as the joints.
+        try:
+            if self.object is not None:
+                vel_attr = self.object._prim.GetAttribute("velocities")
+                if vel_attr and vel_attr.HasValue():
+                    n = len(np.array(vel_attr.Get()))
+                    vel_attr.Set(
+                        Vt.Vec3fArray.FromNumpy(np.zeros((n, 3), dtype=np.float32))
+                    )
+        except Exception as err:
+            logger.warning(f"reset particle-vel zero failed: {err}")
 
         # Apply randomization if enabled in config
         if self.texture_cfg.get("enable", False):
